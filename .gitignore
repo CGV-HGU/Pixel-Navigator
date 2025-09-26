@@ -1,1 +1,10 @@
 __pycache__
+
+checkpoints/
+mobileclip_blt.ts
+hm3d_eval_trajectory/
+tmp/
+objnav_hm3d.csv
+data/
+constants.py
+monitor-panoramic.jpg

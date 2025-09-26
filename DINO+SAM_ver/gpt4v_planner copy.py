@@ -16,6 +16,9 @@ class GPT4V_Planner:
         # ---- LLM/플래너/모듈별 시간 계측 저장소 ----
         self.llm_call_count = 0
         self.llm_durations = []          # 각 LLM 호출 소요시간(초)
+        self.planner_durations = []      # 각 make_plan 호출 전체 소요시간(초)
+        self.dino_durations = []         # make_plan 1회당 DINO 총 시간(초) (여러 회 감지 합산)
+        self.sam_durations = []          # make_plan 1회당 SAM 총 시간(초)
     
     def reset(self,object_goal):
         # translation to align for the detection model
@@ -32,6 +35,9 @@ class GPT4V_Planner:
         # ---- 에피소드 시작 시 계측 초기화 ----
         self.llm_call_count = 0
         self.llm_durations = []
+        self.planner_durations = []
+        self.dino_durations = []
+        self.sam_durations = []
 
 
     def concat_panoramic(self,images,angles):
@@ -51,8 +57,14 @@ class GPT4V_Planner:
         return background_image
     
     def make_plan(self,pano_images):
+        _plan_t0 = time.perf_counter()
+        _dino_total = 0.0
+        _sam_total = 0.0
+
         direction,goal_flag = self.query_gpt4v(pano_images)
         direction_image = pano_images[direction]
+
+        _t = time.perf_counter()
         target_bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),self.detect_objects,self.dino_model)
         if self.detect_objects.index(self.object_goal) not in target_bbox.class_id:
             goal_flag = False
@@ -61,8 +73,13 @@ class GPT4V_Planner:
             bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),[self.object_goal],self.dino_model)    
         else:
             bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),['floor'],self.dino_model)
+
+        _dino_total += (time.perf_counter() - _t)
+
         try:
+            _t = time.perf_counter()
             mask = sam_masking(direction_image,bbox.xyxy,self.sam_model)
+            _sam_total += (time.perf_counter() - _t)
         except:
             mask = np.ones_like(direction_image).mean(axis=-1)
         
@@ -77,9 +94,14 @@ class GPT4V_Planner:
         debug_image = cv2.rectangle(debug_image,(pixel_x-8,pixel_y-8),(pixel_x+8,pixel_y+8),(255,0,0),-1)
         debug_mask = cv2.rectangle(debug_mask,(pixel_x-8,pixel_y-8),(pixel_x+8,pixel_y+8),(255,255,255),-1)
         debug_mask = debug_mask.mean(axis=-1)
+
+        # ---- 이번 make_plan 호출의 시간 기록 ----
+        self.planner_durations.append(time.perf_counter() - _plan_t0)
+        self.dino_durations.append(_dino_total)
+        self.sam_durations.append(_sam_total)
+        
         return direction_image,debug_mask,debug_image,direction,goal_flag
-
-
+        
     def query_gpt4v(self, pano_images):
         angles = (np.arange(len(pano_images))) * 30
         inference_image = cv2.cvtColor(self.concat_panoramic(pano_images, angles), cv2.COLOR_BGR2RGB)

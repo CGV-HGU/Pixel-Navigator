@@ -1,21 +1,21 @@
 import numpy as np
 from llm_utils.gpt_request import gptv_response
 from llm_utils.nav_prompt import GPT4V_PROMPT
-from cv_utils.detection_tools import *
-from cv_utils.segmentation_tools import *
+from cv_utils.yoloe_tools import *
 import cv2
 import ast
 import time  # <-- 추가
 
 class GPT4V_Planner:
-    def __init__(self,dino_model,sam_model):
+    def __init__(self,yoloe_model):
         self.gptv_trajectory = []
-        self.dino_model = dino_model
-        self.sam_model = sam_model
+        self.yoloe_model = yoloe_model
         self.detect_objects = ['bed','sofa','chair','plant','tv','toilet','floor']
         # ---- LLM/플래너/모듈별 시간 계측 저장소 ----
         self.llm_call_count = 0
         self.llm_durations = []          # 각 LLM 호출 소요시간(초)
+        self.planner_durations = []      # 각 make_plan 호출 전체 소요시간(초)
+
     
     def reset(self,object_goal):
         # translation to align for the detection model
@@ -32,6 +32,7 @@ class GPT4V_Planner:
         # ---- 에피소드 시작 시 계측 초기화 ----
         self.llm_call_count = 0
         self.llm_durations = []
+        self.planner_durations = []
 
 
     def concat_panoramic(self,images,angles):
@@ -51,20 +52,59 @@ class GPT4V_Planner:
         return background_image
     
     def make_plan(self,pano_images):
+        _plan_t0 = time.perf_counter()
+
         direction,goal_flag = self.query_gpt4v(pano_images)
         direction_image = pano_images[direction]
-        target_bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),self.detect_objects,self.dino_model)
-        if self.detect_objects.index(self.object_goal) not in target_bbox.class_id:
-            goal_flag = False
 
-        if goal_flag:
-            bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),[self.object_goal],self.dino_model)    
-        else:
-            bbox = openset_detection(cv2.cvtColor(direction_image,cv2.COLOR_BGR2RGB),['floor'],self.dino_model)
+        # --- YOLOE: segmentation-only (no bboxes) ---
+        floor_aliases = ['floor', 'ground', 'flooring']
+        goal_name = self.object_goal
+        prompt_classes = list(dict.fromkeys(self.detect_objects + floor_aliases))  # 중복 제거
+
+        yoloe_objects = yoloe_detection(
+            cv2.cvtColor(direction_image, cv2.COLOR_BGR2RGB),
+            prompt_classes,
+            self.yoloe_model,
+            box_threshold=0.25,
+            iou_threshold=0.50,
+            run_extra_nms=False,      # 박스 NMS 불필요(마스크만 사용)
+            use_text_prompt=True,
+        )
+
+        H, W = direction_image.shape[:2]
+        # 기본 폴백(세그가 전혀 없을 때)
+        mask = np.ones_like(direction_image).mean(axis=-1)
+
+        # 클래스 인덱스 계산
         try:
-            mask = sam_masking(direction_image,bbox.xyxy,self.sam_model)
-        except:
-            mask = np.ones_like(direction_image).mean(axis=-1)
+            goal_idx = prompt_classes.index(goal_name)
+        except ValueError:
+            goal_idx = -1
+        floor_idx_set = {prompt_classes.index(n) for n in floor_aliases if n in prompt_classes}
+
+        # 세그멘트가 있을 때만 선택 로직 수행
+        if yoloe_objects.masks is not None and len(yoloe_objects.masks) > 0:
+            cls_ids = getattr(yoloe_objects, "class_id", np.empty((0,), dtype=int))
+
+            # 1) 목표 물체가 있으면: 그 클래스 마스크 중 '면적 최대' 선택
+            if goal_idx >= 0 and np.any(cls_ids == goal_idx):
+                goal_flag = True
+                idxs = np.where(cls_ids == goal_idx)[0]
+                areas = [yoloe_objects.masks[i].sum() for i in idxs]
+                top = int(idxs[int(np.argmax(areas))])
+                mask = yoloe_objects.masks[top].astype(np.uint8)
+
+            else:
+                # 2) 목표가 없으면: 바닥 계열 마스크 union, 없으면 폴백 유지
+                goal_flag = False
+                sel = np.where(np.isin(cls_ids, list(floor_idx_set)))[0]
+                if len(sel) > 0:
+                    m = np.zeros((H, W), dtype=np.uint8)
+                    for i in sel:
+                        m |= yoloe_objects.masks[i].astype(np.uint8)
+                    mask = m
+
         
         self.direction_image_trajectory.append(direction_image)
         self.direction_mask_trajectory.append(mask)
@@ -77,9 +117,12 @@ class GPT4V_Planner:
         debug_image = cv2.rectangle(debug_image,(pixel_x-8,pixel_y-8),(pixel_x+8,pixel_y+8),(255,0,0),-1)
         debug_mask = cv2.rectangle(debug_mask,(pixel_x-8,pixel_y-8),(pixel_x+8,pixel_y+8),(255,255,255),-1)
         debug_mask = debug_mask.mean(axis=-1)
+
+        # ---- 이번 make_plan 호출의 시간 기록 ----
+        self.planner_durations.append(time.perf_counter() - _plan_t0)
+
         return direction_image,debug_mask,debug_image,direction,goal_flag
-
-
+        
     def query_gpt4v(self, pano_images):
         angles = (np.arange(len(pano_images))) * 30
         inference_image = cv2.cvtColor(self.concat_panoramic(pano_images, angles), cv2.COLOR_BGR2RGB)
