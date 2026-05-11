@@ -1,88 +1,132 @@
 import os
-import base64
 import cv2
 import numpy as np
-from mimetypes import guess_type
 
-# Google Gemini SDK
-import google.generativeai as genai
-from google.generativeai import types
+import vertexai
+from vertexai.generative_models import GenerativeModel, Image
 
-# -----------------------------
-# Gemini 초기화
-# -----------------------------
-_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-if not _API_KEY:
-    raise RuntimeError("GEMINI_API_KEY 또는 GOOGLE_API_KEY 환경변수를 설정하세요.")
-genai.configure(api_key=_API_KEY)
 
-# 모델 이름(원하면 환경변수로 덮어쓰기 가능)
-TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-2.0-flash")
-VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", TEXT_MODEL)  # 1.5 계열은 멀티모달 지원
+_ADC_CANDIDATE_PATHS = [
+    os.path.expanduser("~/.config/gcloud/application_default_credentials.json"),
+    os.path.expanduser("~/gcloud/application_default_credentials.json"),
+    os.path.abspath("gcloud/application_default_credentials.json"),
+]
+if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+    for _adc_path in _ADC_CANDIDATE_PATHS:
+        if os.path.isfile(_adc_path):
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _adc_path
+            break
 
-# -----------------------------
-# 이미지 → Gemini 파트 변환 (data URL 대신, 바이트 전달)
-# -----------------------------
-def _image_to_gemini_part(image):
-    """
-    image: 파일 경로(str) 또는 numpy.ndarray(BGR, OpenCV)
-    return: {"mime_type": "...", "data": <bytes>}
-    """
+
+def _read_project_from_gcloud_config():
+    active_cfg = "default"
+    active_cfg_path = os.path.expanduser("~/.config/gcloud/active_config")
+    if os.path.isfile(active_cfg_path):
+        try:
+            with open(active_cfg_path, "r", encoding="utf-8") as f:
+                name = f.read().strip()
+                if name:
+                    active_cfg = name
+        except Exception:
+            pass
+
+    cfg_path = os.path.expanduser(f"~/.config/gcloud/configurations/config_{active_cfg}")
+    if not os.path.isfile(cfg_path):
+        return None
+
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("project"):
+                    _, value = s.split("=", 1)
+                    project_id = value.strip()
+                    if project_id:
+                        return project_id
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_vertex_project():
+    for key in ("VERTEX_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT", "GCP_PROJECT"):
+        value = os.getenv(key)
+        if value:
+            return value
+
+    try:
+        import google.auth
+
+        _, project_id = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        if project_id:
+            return project_id
+    except Exception:
+        pass
+
+    project_id = _read_project_from_gcloud_config()
+    if project_id:
+        return project_id
+
+    raise RuntimeError(
+        "Vertex project id를 찾을 수 없습니다. "
+        "GOOGLE_CLOUD_PROJECT를 설정하거나 gcloud config set project <PROJECT_ID>를 실행하세요."
+    )
+
+
+_PROJECT_ID = _resolve_vertex_project()
+_LOCATION = (
+    os.environ.get("VERTEX_LOCATION")
+    or os.environ.get("GOOGLE_CLOUD_LOCATION")
+    or "us-central1"
+)
+
+vertexai.init(project=_PROJECT_ID, location=_LOCATION)
+
+TEXT_MODEL = os.getenv("VERTEX_TEXT_MODEL", os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash"))
+VISION_MODEL = os.getenv("VERTEX_VISION_MODEL", os.getenv("GEMINI_VISION_MODEL", TEXT_MODEL))
+MAX_OUTPUT_TOKENS = int(os.getenv("VERTEX_MAX_OUTPUT_TOKENS", "1000"))
+
+
+def local_image_to_vertex_image(image):
     if isinstance(image, str):
-        mime_type, _ = guess_type(image)
-        mime_type = mime_type or "image/jpeg"
-        with open(image, "rb") as f:
-            return {"mime_type": mime_type, "data": f.read()}
+        return Image.load_from_file(image)
 
-    elif isinstance(image, np.ndarray):
+    if isinstance(image, np.ndarray):
         ok, buf = cv2.imencode(".jpg", image)
         if not ok:
             raise ValueError("이미지 인코딩 실패")
-        return {"mime_type": "image/jpeg", "data": buf.tobytes()}
+        return Image.from_bytes(buf.tobytes())
 
-    else:
-        raise TypeError("image must be a file path (str) or numpy.ndarray")
+    raise TypeError("image must be a file path (str) or numpy.ndarray")
 
-# -----------------------------
-# 텍스트 전용 응답
-# -----------------------------
-def gpt_response(text_prompt, system_prompt=""):
-    """
-    Gemini로 텍스트 응답 생성. 기존 함수명 유지.
-    """
-    model = genai.GenerativeModel(
-        model_name=TEXT_MODEL,
-        # system_prompt 개념: Gemini는 system_instruction에 넣어 사용
-        system_instruction=system_prompt or None,
-    )
-    resp = model.generate_content(
-        text_prompt,
-        generation_config=types.GenerationConfig(
-            max_output_tokens=1000,
-        ),
-    )
-    # 실패/빈 응답 대비
-    return getattr(resp, "text", "").strip()
 
-# -----------------------------
-# 텍스트 + 이미지(멀티모달) 응답
-# -----------------------------
+def _system_instruction(system_prompt):
+    return [system_prompt] if system_prompt else None
+
+
+def _generation_config():
+    return {"max_output_tokens": MAX_OUTPUT_TOKENS}
+
+
 def gptv_response(text_prompt, image_prompt, system_prompt=""):
-    """
-    Gemini로 멀티모달 응답 생성. 기존 함수명 유지.
-    image_prompt: 이미지 경로(str) 또는 OpenCV의 np.ndarray
-    """
-    img_part = _image_to_gemini_part(image_prompt)
-
-    model = genai.GenerativeModel(
+    model = GenerativeModel(
         model_name=VISION_MODEL,
-        system_instruction=system_prompt or None,
+        system_instruction=_system_instruction(system_prompt),
     )
-    # 멀티모달은 리스트로 텍스트와 이미지를 함께 전달
-    resp = model.generate_content(
-        [text_prompt, img_part],
-        generation_config=types.GenerationConfig(
-            max_output_tokens=1000,
-        ),
+    response = model.generate_content(
+        [text_prompt, local_image_to_vertex_image(image_prompt)],
+        generation_config=_generation_config(),
     )
-    return getattr(resp, "text", "").strip()
+    return getattr(response, "text", "").strip()
+
+
+def gpt_response(text_prompt, system_prompt=""):
+    model = GenerativeModel(
+        model_name=TEXT_MODEL,
+        system_instruction=_system_instruction(system_prompt),
+    )
+    response = model.generate_content(
+        text_prompt,
+        generation_config=_generation_config(),
+    )
+    return getattr(response, "text", "").strip()
