@@ -21,12 +21,20 @@ cd ../Segment-Anything/
 pip install -e .
 ```
 
-### Prepare your GPT4V API Keys ###
-To emphasize our contribution on the pixel navigation skill, in this repo, we replace the original complicated high-level planning process with GPT-4V. And you should prepare for your own api-keys and api-endpoint. You can check the ./llm_utils/gpt_request.py for more details.
+### Prepare the local VLM endpoint ###
+The PixelNav planning prompt and `Reason`/`Angle`/`Flag` response contract are
+kept unchanged, while requests are sent to the same OpenAI-compatible local VLM
+endpoint used by `s2e-vlm-async-framework`.
 ```
-export OPENAI_API_KEY=<YOUR KEYS>
-export OPENAI_API_ENDPOINT=<YOUR_ENDPOINT>
+export VLM_API_URL=http://server-02.cgv:8000/v1/chat/completions
+export VLM_API_MODEL=qwen3.5-9b-instruct
+export VLM_API_TIMEOUT_S=120
+export VLM_API_MAX_TOKENS=1024
+# Optional when the server requires authentication:
+export VLM_API_KEY=<YOUR_KEY>
 ```
+The default URL and model already match these values. `VLM_API_KEY` is optional
+and must not be committed.
 
 ### Download the checkpoints ###
 | Module | Approach | Weight | Config |
@@ -80,6 +88,5 @@ Please cite our paper if you find it helpful :)
   organization={IEEE}
 }
 ```
-
 
 

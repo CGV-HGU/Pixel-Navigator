@@ -1,132 +1,240 @@
+"""OpenAI-compatible VLM transport used by the PixelNav planner.
+
+The navigation pipeline still owns the original PixelNav prompt and parses the
+same Reason/Angle/Flag response. This module only replaces the remote Vertex
+AI transport with the local chat-completions endpoint used by the S2E runtime.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
 import os
+import urllib.error
+import urllib.request
+from mimetypes import guess_type
+from pathlib import Path
+from typing import Any, Mapping
+
 import cv2
 import numpy as np
 
-import vertexai
-from vertexai.generative_models import GenerativeModel, Image
+
+DEFAULT_API_URL = "http://server-02.cgv:8000/v1/chat/completions"
+DEFAULT_MODEL = "qwen3.5-9b-instruct"
+
+_PIXELNAV_DIRECTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "Reason": {"type": "string"},
+        "Angle": {
+            "type": "integer",
+            "enum": list(range(0, 360, 30)),
+        },
+        "Flag": {"type": "boolean"},
+    },
+    "required": ["Reason", "Angle", "Flag"],
+}
 
 
-_ADC_CANDIDATE_PATHS = [
-    os.path.expanduser("~/.config/gcloud/application_default_credentials.json"),
-    os.path.expanduser("~/gcloud/application_default_credentials.json"),
-    os.path.abspath("gcloud/application_default_credentials.json"),
-]
-if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-    for _adc_path in _ADC_CANDIDATE_PATHS:
-        if os.path.isfile(_adc_path):
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _adc_path
-            break
+class VlmApiError(RuntimeError):
+    """Raised when the local chat-completions endpoint violates its contract."""
 
 
-def _read_project_from_gcloud_config():
-    active_cfg = "default"
-    active_cfg_path = os.path.expanduser("~/.config/gcloud/active_config")
-    if os.path.isfile(active_cfg_path):
-        try:
-            with open(active_cfg_path, "r", encoding="utf-8") as f:
-                name = f.read().strip()
-                if name:
-                    active_cfg = name
-        except Exception:
-            pass
-
-    cfg_path = os.path.expanduser(f"~/.config/gcloud/configurations/config_{active_cfg}")
-    if not os.path.isfile(cfg_path):
-        return None
-
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
     try:
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                if s.startswith("project"):
-                    _, value = s.split("=", 1)
-                    project_id = value.strip()
-                    if project_id:
-                        return project_id
-    except Exception:
-        return None
-    return None
+        value = int(raw)
+    except ValueError as error:
+        raise VlmApiError(f"{name} must be an integer, got {raw!r}") from error
+    if value <= 0:
+        raise VlmApiError(f"{name} must be positive, got {value}")
+    return value
 
 
-def _resolve_vertex_project():
-    for key in ("VERTEX_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT", "GCP_PROJECT"):
-        value = os.getenv(key)
-        if value:
-            return value
-
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default)).strip()
     try:
-        import google.auth
-
-        _, project_id = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-        if project_id:
-            return project_id
-    except Exception:
-        pass
-
-    project_id = _read_project_from_gcloud_config()
-    if project_id:
-        return project_id
-
-    raise RuntimeError(
-        "Vertex project id를 찾을 수 없습니다. "
-        "GOOGLE_CLOUD_PROJECT를 설정하거나 gcloud config set project <PROJECT_ID>를 실행하세요."
-    )
+        value = float(raw)
+    except ValueError as error:
+        raise VlmApiError(f"{name} must be numeric, got {raw!r}") from error
+    if value <= 0:
+        raise VlmApiError(f"{name} must be positive, got {value}")
+    return value
 
 
-_PROJECT_ID = _resolve_vertex_project()
-_LOCATION = (
-    os.environ.get("VERTEX_LOCATION")
-    or os.environ.get("GOOGLE_CLOUD_LOCATION")
-    or "us-central1"
-)
-
-vertexai.init(project=_PROJECT_ID, location=_LOCATION)
-
-TEXT_MODEL = os.getenv("VERTEX_TEXT_MODEL", os.getenv("GEMINI_TEXT_MODEL", "gemini-2.5-flash"))
-VISION_MODEL = os.getenv("VERTEX_VISION_MODEL", os.getenv("GEMINI_VISION_MODEL", TEXT_MODEL))
-MAX_OUTPUT_TOKENS = int(os.getenv("VERTEX_MAX_OUTPUT_TOKENS", "1000"))
-
-
-def local_image_to_vertex_image(image):
+def local_image_to_data_url(image: str | np.ndarray) -> str:
+    """Encode a path or OpenCV image as an inline image data URL."""
     if isinstance(image, str):
-        return Image.load_from_file(image)
+        path = Path(image)
+        try:
+            payload = path.read_bytes()
+        except OSError as error:
+            raise VlmApiError(f"image is unreadable: {path}") from error
+        mime_type = guess_type(path.name)[0] or "image/jpeg"
+    elif isinstance(image, np.ndarray):
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+            raise VlmApiError("image array must be uint8 HxWx3")
+        encoded, buffer = cv2.imencode(".jpg", image)
+        if not encoded:
+            raise VlmApiError("image JPEG encoding failed")
+        payload = buffer.tobytes()
+        mime_type = "image/jpeg"
+    else:
+        raise TypeError("image must be a file path or numpy.ndarray")
 
-    if isinstance(image, np.ndarray):
-        ok, buf = cv2.imencode(".jpg", image)
-        if not ok:
-            raise ValueError("이미지 인코딩 실패")
-        return Image.from_bytes(buf.tobytes())
-
-    raise TypeError("image must be a file path (str) or numpy.ndarray")
+    content = base64.b64encode(payload).decode("ascii")
+    return f"data:{mime_type};base64,{content}"
 
 
-def _system_instruction(system_prompt):
-    return [system_prompt] if system_prompt else None
+def _structured_output(payload: dict[str, Any]) -> dict[str, Any]:
+    mode = os.getenv("VLM_STRUCTURED_OUTPUT_MODE", "openai_json_schema").strip()
+    schema = {
+        "name": "pixelnav_direction_v1",
+        "strict": True,
+        "schema": _PIXELNAV_DIRECTION_SCHEMA,
+    }
+    if mode in {"", "openai_json_schema"}:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": schema,
+        }
+        return payload
+    if mode == "vllm_no_whitespace":
+        payload["structured_outputs"] = {
+            "json": _PIXELNAV_DIRECTION_SCHEMA,
+            "disable_any_whitespace": True,
+        }
+        return payload
+    raise VlmApiError(f"unsupported VLM_STRUCTURED_OUTPUT_MODE: {mode!r}")
 
 
-def _generation_config():
-    return {"max_output_tokens": MAX_OUTPUT_TOKENS}
+def _extract_content(response_payload: Mapping[str, Any]) -> str:
+    choices = response_payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise VlmApiError("chat-completions response has no choices")
+    first = choices[0]
+    message = first.get("message") if isinstance(first, Mapping) else None
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if isinstance(content, Mapping):
+        content = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    if not isinstance(content, str) or not content.strip():
+        raise VlmApiError("chat-completions response has no message content")
+    return content.strip()
+
+
+def _normalize_direction_content(content: str) -> str:
+    """Validate JSON output and adapt booleans for PixelNav's literal parser."""
+    try:
+        answer = json.loads(content)
+    except json.JSONDecodeError as error:
+        raise VlmApiError("VLM direction response is not valid JSON") from error
+
+    if not isinstance(answer, Mapping):
+        raise VlmApiError("VLM direction response must be a JSON object")
+    if set(answer) != {"Reason", "Angle", "Flag"}:
+        raise VlmApiError(
+            "VLM direction response must contain only Reason, Angle, and Flag"
+        )
+
+    reason = answer["Reason"]
+    angle = answer["Angle"]
+    flag = answer["Flag"]
+    if not isinstance(reason, str):
+        raise VlmApiError("VLM direction Reason must be a string")
+    if (
+        isinstance(angle, bool)
+        or not isinstance(angle, int)
+        or angle not in range(0, 360, 30)
+    ):
+        raise VlmApiError("VLM direction Angle must be one of 0, 30, ..., 330")
+    if not isinstance(flag, bool):
+        raise VlmApiError("VLM direction Flag must be a boolean")
+
+    # gpt4v_planner.py uses ast.literal_eval, whose boolean spellings are
+    # True/False rather than JSON's true/false. repr keeps that contract.
+    return repr({"Reason": reason, "Angle": angle, "Flag": flag})
+
+
+def _chat_completions(payload: Mapping[str, Any]) -> str:
+    api_url = os.getenv("VLM_API_URL", DEFAULT_API_URL).strip()
+    if not api_url:
+        raise VlmApiError("VLM_API_URL is empty")
+
+    headers = {"Content-Type": "application/json"}
+    api_key = os.getenv("VLM_API_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    request = urllib.request.Request(
+        api_url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    timeout_s = _positive_float_env("VLM_API_TIMEOUT_S", 120.0)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raise VlmApiError(
+            f"VLM API returned HTTP {error.code} for {api_url}"
+        ) from error
+    except (urllib.error.URLError, TimeoutError) as error:
+        raise VlmApiError(f"VLM API request failed for {api_url}: {error}") from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise VlmApiError("VLM API returned invalid JSON") from error
+
+    if not isinstance(response_payload, Mapping):
+        raise VlmApiError("VLM API response must be a JSON object")
+    return _extract_content(response_payload)
+
+
+def _messages(text_prompt: str, system_prompt: str, *, image_url: str | None = None):
+    messages: list[dict[str, Any]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    if image_url is None:
+        user_content: Any = text_prompt
+    else:
+        user_content = [
+            {"type": "text", "text": text_prompt},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+    messages.append({"role": "user", "content": user_content})
+    return messages
 
 
 def gptv_response(text_prompt, image_prompt, system_prompt=""):
-    model = GenerativeModel(
-        model_name=VISION_MODEL,
-        system_instruction=_system_instruction(system_prompt),
-    )
-    response = model.generate_content(
-        [text_prompt, local_image_to_vertex_image(image_prompt)],
-        generation_config=_generation_config(),
-    )
-    return getattr(response, "text", "").strip()
+    """Return one structured PixelNav direction decision from the local VLM."""
+    model = os.getenv("VLM_API_MODEL", DEFAULT_MODEL).strip()
+    if not model:
+        raise VlmApiError("VLM_API_MODEL is empty")
+    payload = {
+        "model": model,
+        "messages": _messages(
+            str(text_prompt),
+            str(system_prompt),
+            image_url=local_image_to_data_url(image_prompt),
+        ),
+        "temperature": 0.0,
+        "max_tokens": _positive_int_env("VLM_API_MAX_TOKENS", 1024),
+    }
+    content = _chat_completions(_structured_output(payload))
+    return _normalize_direction_content(content)
 
 
 def gpt_response(text_prompt, system_prompt=""):
-    model = GenerativeModel(
-        model_name=TEXT_MODEL,
-        system_instruction=_system_instruction(system_prompt),
+    """Return an unconstrained text completion from the same local model."""
+    model = os.getenv("VLM_API_MODEL", DEFAULT_MODEL).strip()
+    if not model:
+        raise VlmApiError("VLM_API_MODEL is empty")
+    return _chat_completions(
+        {
+            "model": model,
+            "messages": _messages(str(text_prompt), str(system_prompt)),
+            "temperature": 0.0,
+            "max_tokens": _positive_int_env("VLM_API_MAX_TOKENS", 1024),
+        }
     )
-    response = model.generate_content(
-        text_prompt,
-        generation_config=_generation_config(),
-    )
-    return getattr(response, "text", "").strip()
